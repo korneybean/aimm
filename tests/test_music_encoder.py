@@ -139,6 +139,28 @@ class MusicEncoderTests(unittest.TestCase):
         self.assertEqual(result['status'], 'incompatible_dimensions')
         self.assertIsNone(result['cosine_similarity'])
 
+    def test_text_encoder_health_rejects_collapsed_representations(self):
+        check = getattr(self.encoder, 'check_text_encoder_health', None)
+        self.assertTrue(callable(check), 'A collapsed text encoder must be rejected')
+        for vectors in (np.ones((4, 4)), np.array([[1., 0., 0., 0.]]) + .001 * np.eye(4)):
+            with self.subTest(vectors=vectors), self.assertRaisesRegex(RuntimeError, 'collapsed'):
+                check(vectors)
+
+    def test_text_encoder_health_accepts_distinct_representations(self):
+        check = getattr(self.encoder, 'check_text_encoder_health', None)
+        self.assertTrue(callable(check), 'Text encoder diagnostics must be available')
+        report = check(np.eye(4))
+        self.assertEqual(report['status'], 'passed')
+        self.assertEqual(report['mean_pairwise_cosine'], 0.)
+        self.assertEqual(report['probe_count'], 4)
+
+    def test_text_encoder_health_rejects_invalid_probe_vectors(self):
+        check = getattr(self.encoder, 'check_text_encoder_health', None)
+        self.assertTrue(callable(check), 'Invalid text encoder probes must be rejected')
+        for vectors in (np.ones((1, 4)), np.zeros((4, 4)), np.full((4, 4), np.nan)):
+            with self.subTest(vectors=vectors), self.assertRaises(ValueError):
+                check(vectors)
+
 
 if __name__ == '__main__':
     unittest.main()
