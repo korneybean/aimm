@@ -13,7 +13,7 @@ import numpy as np
 import soundfile as sf
 import librosa
 
-VERSION = '1.0.0'
+VERSION = '1.1.0'
 
 
 def _round(value, places=4):
@@ -29,8 +29,13 @@ def _hash(path):
     return h.hexdigest()
 
 
-def analyze(path, *, hop_length=512, max_duration=None):
+def analyze(path, *, hop_length=512, max_duration=None, encoder=None,
+            encoder_backend=None, encoder_prompts=None):
     """Analyze an audio file; descriptors are estimates, not semantic ground truth."""
+    if encoder not in (None, 'none', 'clap'):
+        raise ValueError('Unknown music encoder; supported values: none, clap')
+    if max_duration is not None and (not math.isfinite(max_duration) or max_duration <= 0):
+        raise ValueError('max_duration must be positive and finite')
     path = Path(path)
     if not path.is_file():
         raise FileNotFoundError(path)
@@ -91,13 +96,22 @@ def analyze(path, *, hop_length=512, max_duration=None):
         'mood_tags': [],
         'lyrics': None,
     }
-    return {
+    result = {
         'format': 'AIFM', 'version': VERSION,
         'audio': {'uri': path.name, 'sha256': _hash(path), 'duration_sec': _round(duration), 'source_duration_sec': _round(info.duration), 'sample_rate': info.samplerate, 'channels': info.channels, 'analyzed_sample_rate': sr, 'partial_analysis': max_duration is not None and info.duration > duration + 0.01},
         'features': features,
         'provenance': {'energy_curve': 'measured normalized RMS', 'onset_candidates_sec': 'librosa spectral flux onset detector', 'tempo_bpm': 'librosa beat tracker, estimated', 'beats_sec': 'librosa beat tracker, estimated', 'sections': 'heuristic RMS novelty, unlabeled', 'spectral_centroid_hz_mean': 'measured spectral descriptor', 'zero_crossing_rate_mean': 'measured waveform descriptor', 'pitch_class_salience': 'mean STFT chroma, not chords or key'},
         'uncertainty': {'tempo_bpm': 'unknown' if tempo is None else 'estimated; half/double-time ambiguity', 'sections': 'heuristic boundaries; no semantic section labels', 'harmony': 'not inferred', 'instruments': 'not inferred', 'mood_tags': 'not inferred', 'lyrics': 'not transcribed'}
     }
+    if encoder == 'clap':
+        from music_encoder import DEFAULT_PROMPTS, encode_music
+        features['music_encoder'] = encode_music(
+            path, backend=encoder_backend, max_duration=max_duration,
+            prompts=DEFAULT_PROMPTS if encoder_prompts is None else encoder_prompts,
+        )
+        result['provenance']['music_encoder'] = 'Pretrained CLAP music encoder; pinned model revision and timed chunks included'
+        result['uncertainty']['music_encoder'] = 'Description matches are model estimates, not verified labels or probabilities'
+    return result
 
 
 def validate(data):
@@ -111,10 +125,12 @@ def validate(data):
     return True
 
 
-def pack(audio_path, destination, *, data=None):
+def pack(audio_path, destination, *, data=None, encoder=None):
     """Create a ZIP-based .aim container with embedded original audio and JSON."""
     audio_path = Path(audio_path)
-    data = analyze(audio_path) if data is None else data
+    if data is not None and encoder not in (None, 'none'):
+        raise ValueError('Supply either existing analysis or an encoder, not both')
+    data = analyze(audio_path, encoder=encoder) if data is None else data
     validate(data)
     if _hash(audio_path) != data['audio']['sha256']:
         raise ValueError('Audio fingerprint mismatch')
@@ -171,7 +187,11 @@ def compare(a, b):
         'zero_crossing_rate_mean': (af.get('zero_crossing_rate_mean'), bf.get('zero_crossing_rate_mean')),
         'tempo_bpm': (af.get('tempo_bpm'), bf.get('tempo_bpm')),
     }
-    return {'comparison_type': 'measured_and_estimated_descriptors', 'tracks': [a['audio']['uri'], b['audio']['uri']], 'descriptors': {key: {'a': x, 'b': y, 'difference_b_minus_a': _round(y-x) if x is not None and y is not None else None} for key, (x, y) in descriptors.items()}, 'limitations': ['Normalized energy is not absolute loudness', 'Spectral brightness is not emotion', 'Tempo is an estimate', 'No inferred emotional or lyrical meaning']}
+    result = {'comparison_type': 'measured_and_estimated_descriptors', 'tracks': [a['audio']['uri'], b['audio']['uri']], 'descriptors': {key: {'a': x, 'b': y, 'difference_b_minus_a': _round(y-x) if x is not None and y is not None else None} for key, (x, y) in descriptors.items()}, 'limitations': ['Normalized energy is not absolute loudness', 'Spectral brightness is not emotion', 'Tempo is an estimate', 'No inferred emotional or lyrical meaning']}
+    if 'music_encoder' in af or 'music_encoder' in bf:
+        from music_encoder import compare_embeddings
+        result['music_encoder'] = compare_embeddings(af.get('music_encoder'), bf.get('music_encoder'))
+    return result
 
 
 def main():
@@ -179,14 +199,17 @@ def main():
     sub = p.add_subparsers(dest='command', required=True)
     a = sub.add_parser('analyze'); a.add_argument('audio'); a.add_argument('-o', '--output'); a.add_argument('--max-duration', type=float)
     pk = sub.add_parser('pack'); pk.add_argument('audio'); pk.add_argument('-o', '--output')
+    for parser in (a, pk):
+        parser.add_argument('--encoder', choices=['none', 'clap'], default='none',
+                            help='Optional pretrained music encoder (requires requirements-encoder.txt)')
     up = sub.add_parser('unpack'); up.add_argument('container'); up.add_argument('-d', '--destination', required=True)
     co = sub.add_parser('compare'); co.add_argument('first'); co.add_argument('second'); co.add_argument('-o', '--output')
     args = p.parse_args()
     if args.command == 'analyze':
-        result = analyze(args.audio, max_duration=args.max_duration)
+        result = analyze(args.audio, max_duration=args.max_duration, encoder=args.encoder)
         output = Path(args.output or str(Path(args.audio).with_suffix('.aifm.json')))
     elif args.command == 'pack':
-        output = pack(args.audio, args.output or str(Path(args.audio).with_suffix('.aim')))
+        output = pack(args.audio, args.output or str(Path(args.audio).with_suffix('.aim')), encoder=args.encoder)
         print(f'Wrote {output}'); return
     elif args.command == 'unpack':
         print(f'Extracted {unpack(args.container, args.destination)}'); return
