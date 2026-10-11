@@ -1,4 +1,4 @@
-# AIM / AIFM v1.1 — audio analysis and a pretrained music encoder
+# AIM / AIFM v1.1.1 — audio analysis and a pretrained music encoder
 
 AIM is a portable `.aim` ZIP container holding original audio, an `aifm.json` structured analysis and `manifest.json`. AIFM contains measured signal features and, when enabled, pretrained music embeddings and ranked audio-description matches. Source audio is preserved byte-for-byte and verified using SHA-256.
 
@@ -19,7 +19,9 @@ Supports audio formats decoded by `soundfile` (e.g. WAV/FLAC/OGG; MP3 availabili
 
 ## Pretrained music encoder
 
-Enable the optional [LAION music CLAP model](https://huggingface.co/laion/larger_clap_music). CLAP learns a shared representation of audio and text, allowing audio embeddings to be compared with candidate descriptions. This integration uses the official pretrained checkpoint, not randomly initialized weights.
+Enable the optional [LAION general CLAP model](https://huggingface.co/laion/larger_clap_general), trained on general audio, music, and speech. CLAP learns a shared representation of audio and text, allowing audio embeddings to be compared with candidate descriptions. This integration uses the official pretrained checkpoint, not randomly initialized weights.
+
+Version 1.1.1 replaces the previous `larger_clap_music` checkpoint. Its text representations collapsed across different descriptions, a [separately reported model-specific failure](https://github.com/embeddings-benchmark/mteb/issues/5069) reproduced in our real-model tests. Earlier description rankings from that checkpoint should not be used. Reanalyze the original recordings to obtain new embeddings; vectors from the two checkpoints are incompatible.
 
 Install the optional dependencies. For CPU-only use, install PyTorch from its CPU wheel index first:
 
@@ -33,7 +35,8 @@ python aim.py compare first.aifm.json second.aifm.json
 
 The first encoder run downloads and caches the model. Subsequent inference runs locally; audio is not sent to Hugging Face or LAION. Set `HF_HUB_OFFLINE=1` after the checkpoint is cached to require offline operation. Basic analysis still works with only `requirements.txt`; it defaults to `--encoder none`.
 
-- Model: `laion/larger_clap_music`, revision `a0b4534a14f58e20944452dff00a22a06ce629d1` (Apache-2.0).
+- Model: `laion/larger_clap_general`, revision `ada0c23a36c4e8582805bb38fec3905903f18b41` (Apache-2.0).
+- Before a loaded model is used, four deliberately different text probes must have mean pairwise cosine similarity below 0.98. This catches near-constant output; it is not an accuracy test or a confidence threshold. Diagnostics and probe descriptions are saved in AIFM. A failed check stops encoding instead of returning misleading rankings.
 - Model input: 48 kHz mono audio, streamed in consecutive ten-second chunks. Every requested sample is covered, including the final short chunk.
 - Output: 512-dimensional L2-normalized embeddings for audible chunks, exact start/end timestamps, and a duration-weighted normalized track embedding.
 - Final short chunks use the model's repeat padding; pooling weights use their real duration. Effectively silent chunks retain timestamps and receive no description matches.
@@ -45,6 +48,7 @@ Encoder data appears under `features.music_encoder`:
 
 ```text
 model: id + pinned revision
+backend_diagnostics: text_encoder_health
 duration_sec + encoded_duration_sec
 sample_rate + source_sample_rate + source_channels
 embedding_dimension + normalization + pooling
@@ -71,7 +75,15 @@ Candidate choice affects the result. Including only two descriptions forces a co
 python -m unittest discover -s tests -v
 ```
 
-The default suite needs only the base dependencies. It tests analysis, original-byte archive recovery, wrong fingerprints, encoder chunk coverage, short-tail weighting, partial analysis, silence, finite embeddings, AIFM preservation, and model compatibility. Deterministic fixture vectors isolate data handling from neural inference; they are not evidence of model accuracy. Validate pretrained inference separately with an actual recording and the optional dependencies.
+The default suite needs only the base dependencies. It tests analysis, original-byte archive recovery, wrong fingerprints, encoder chunk coverage, short-tail weighting, partial analysis, silence, finite embeddings, AIFM preservation, model compatibility, and text-collapse rejection. Deterministic fixture vectors isolate data handling from neural inference; they are not evidence of model accuracy.
+
+Run the separate pretrained checks with the optional dependencies installed:
+
+```bash
+AIMM_RUN_MODEL_TESTS=1 python -m unittest discover -s tests -v
+```
+
+These checks exercise distinct descriptions, verify that three documented recordings rank their correct description above the other two, and confirm that the old collapsed checkpoint is rejected. The first run downloads both pinned checkpoints and three [librosa example recordings](https://librosa.org/doc/latest/recordings.html): `libri1` (Garth Comira narration, CC-BY 4.0), `pistachio` (Lena Orsa solo piano, CC-BY-NC 3.0), and `trumpet` (Mihai Sorohan, CC-BY 3.0). Recordings are used locally and are not bundled in this repository. These are small regression checks, not a benchmark of general music understanding.
 
 ## Implemented
 

@@ -13,7 +13,7 @@ import numpy as np
 import soundfile as sf
 import librosa
 
-VERSION = '1.1.0'
+VERSION = '1.1.1'
 
 
 def _round(value, places=4):

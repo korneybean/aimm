@@ -8,8 +8,15 @@ import librosa
 import numpy as np
 import soundfile as sf
 
-MODEL_ID = 'laion/larger_clap_music'
-MODEL_REVISION = 'a0b4534a14f58e20944452dff00a22a06ce629d1'
+MODEL_ID = 'laion/larger_clap_general'
+MODEL_REVISION = 'ada0c23a36c4e8582805bb38fec3905903f18b41'
+TEXT_HEALTH_PROBES = (
+    'An electric guitar playing heavy metal.',
+    'Quiet solo piano music.',
+    'A person reading a book aloud.',
+    'A dog barking outdoors.',
+)
+TEXT_COLLAPSE_LIMIT = .98
 DEFAULT_PROMPTS = (
     'A recording of hip hop music with rapping over a beat.',
     'A recording of electronic dance music with synthesizers and drums.',
@@ -47,6 +54,7 @@ class ClapBackend:
 
     def __init__(self):
         self.model = None
+        self.diagnostics = None
 
     def _load(self):
         if self.model is not None:
@@ -60,15 +68,26 @@ class ClapBackend:
                 'Install them with: pip install -r requirements-encoder.txt'
             ) from exc
         self.torch = torch
-        self.processor = ClapProcessor.from_pretrained(
+        processor = ClapProcessor.from_pretrained(
             self.model_id, revision=self.revision, trust_remote_code=False,
         )
         # The official pinned checkpoint supplies PyTorch weights. Modern torch
         # loads these in weights-only mode; no model repository code is executed.
-        self.model = ClapModel.from_pretrained(
+        model = ClapModel.from_pretrained(
             self.model_id, revision=self.revision, trust_remote_code=False,
             use_safetensors=False, weights_only=True,
         ).eval()
+        probes = processor.tokenizer(
+            list(TEXT_HEALTH_PROBES), padding=True, truncation=True, return_tensors='pt',
+        )
+        with torch.inference_mode():
+            vectors = model.get_text_features(**probes).cpu().float().numpy()
+        health = check_text_encoder_health(vectors)
+        health['probe_descriptions'] = list(TEXT_HEALTH_PROBES)
+        # Publish the loaded model only after its text path passes. A failed
+        # load must never leave a cached model that bypasses the next check.
+        self.processor, self.model = processor, model
+        self.diagnostics = {'text_encoder_health': health}
 
     def audio_embedding(self, samples):
         self._load()
@@ -96,6 +115,31 @@ def _unit(vector):
     if not math.isfinite(norm) or norm <= 1e-12:
         raise ValueError('Encoder embeddings must have a finite, nonzero norm')
     return vector / norm
+
+
+def check_text_encoder_health(vectors):
+    """Reject catastrophic collapse on fixed, deliberately different probes.
+
+    This is a basic functionality check, not a measure of musical accuracy.
+    It must not be run on user candidates, which may be intentional synonyms.
+    """
+    vectors = np.asarray(vectors, dtype=np.float64)
+    if vectors.ndim != 2 or len(vectors) < 3:
+        raise ValueError('Text encoder health requires at least three probe vectors')
+    normalized = np.stack([_unit(v) for v in vectors])
+    similarities = np.clip(normalized @ normalized.T, -1., 1.)
+    pairs = similarities[np.triu_indices(len(normalized), 1)]
+    mean = float(pairs.mean())
+    if mean >= TEXT_COLLAPSE_LIMIT:
+        raise RuntimeError(
+            f'Text encoder collapsed: distinct probe descriptions have mean '
+            f'cosine similarity {mean:.6f}. Refusing to produce misleading matches.'
+        )
+    return {'status': 'passed', 'probe_count': len(normalized),
+            'mean_pairwise_cosine': round(mean, 6),
+            'max_pairwise_cosine': round(float(pairs.max()), 6),
+            'collapse_threshold': TEXT_COLLAPSE_LIMIT,
+            'interpretation': 'Basic noncollapse check; not an accuracy or confidence score'}
 
 
 def _matches(vector, text_vectors, prompts):
@@ -167,6 +211,7 @@ def encode_music(path, *, backend=None, prompts=DEFAULT_PROMPTS, max_duration=No
     return {
         'status': 'encoded' if vectors else 'no_audible_audio',
         'model': {'id': backend.model_id, 'revision': backend.revision},
+        'backend_diagnostics': getattr(backend, 'diagnostics', None),
         'sample_rate': backend.sample_rate, 'channels': 1,
         'source_sample_rate': source_rate, 'source_channels': source_channels,
         'window_seconds': backend.window_seconds,
